@@ -2,7 +2,7 @@
 
 Codes for analyzing the data used in Yesin et al., paper.
 
-> Yesin A*, Outlaw K*, Sanchez-Lopez R, Doucoure A, Hüttenhain R, Thiam HR (2026). Nuclear remodeling and high deformability emerge early while migration is progressively optimized during HSCs to neutrophils differentiation. *[Journal]*. [DOI]
+> Yesin A*, Outlaw K*, Sanchez-Lopez R, Doucoure A, Hüttenhain R, Thiam HR (2026). Nuclear remodeling and high deformability emerge early while migration is progressively optimized during HSCs to neutrophils differentiation. 
 
 *Shared first authorship
 

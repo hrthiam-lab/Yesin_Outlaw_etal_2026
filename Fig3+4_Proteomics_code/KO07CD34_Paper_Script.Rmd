@@ -1,0 +1,739 @@
+---
+title: "KO07CD34 — Full Paper Analysis Script"
+author: "Huttenhain Lab"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+<!--
+KO07CD34_Paper_Script.Rmd
+-----------------------------------------------------------------------------
+One file, start to finish: optionally the raw Spectronaut report itself
+(section 1a, off by default -- see RUN_RAW_IMPORT), otherwise the
+already-processed MSstats output (section 1b) -> D9.2 exclusion -> PCA ->
+Pearson/Spearman correlation -> Figure 3A (temporal cluster heatmap + trend
+lines + GO with simplify()) -> volcano plots (raw + adjusted p) -> GO
+Up/Down bar plots with simplify() -> Figure 4A (HPA nuclear/lamina heatmap)
+-> every output table. Figure3A_Cluster_Heatmap_GO_noD9.2.R,
+Figure4A_Nuclear_Heatmap.R, and GO_Simplify_UpDown.R are `source()`d rather
+than re-typed, so each stays a single source of truth and prints its own
+"Saved: <path>" lines. Everything else (PCA, correlation, volcano, output
+tables) is written directly in this file.
+
+Requirements: R 4.x, plus the CRAN/Bioconductor packages listed in this
+folder's README.md. Needs network access at knit time to source() the
+Huttenhain Lab's shared bp_utils/drb_utils helper scripts from GitHub, and to
+query UniProt / org.Hs.eg.db for gene-name mapping.
+
+Usage:
+    rmarkdown::render("KO07CD34_Paper_Script.Rmd")   # from this folder
+    # or open in RStudio and knit top to bottom.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# All packages, paths, constants, and the shared color palette live here --
+# every step below assumes this has already run.
+source("R/00_setup.R")
+source("R/01_data_loading.R")
+source("R/02_pca_functions.R")
+source("R/03_correlation_functions.R")
+source("R/04_temporal_cluster_functions.R")
+source("R/05_go_enrichment_functions.R")
+source("R/06_volcano_functions.R")
+```
+
+# 1. Load data from the mass spec / MSstats output
+
+One switch controls the source. **`TRUE`**: raw Spectronaut report through
+MSstats yourself (section 1a) -- needs network access and the raw `.tsv`
+file at `spectronaut.lfq.report` below. **`FALSE`** (default): the four
+already-computed MSstats output CSVs in `data_dir` (section 1b).
+
+```{r raw-import-toggle}
+RUN_RAW_IMPORT <- FALSE
+```
+
+## 1a. (Optional) Import raw Spectronaut data through MSstats
+
+Only runs if `RUN_RAW_IMPORT` is `TRUE`: raw Spectronaut report ->
+contaminant removal -> `SpectronauttoMSstatsFormat()` -> `dataProcess()` ->
+gene name mapping -> `groupComparison()`.
+
+```{r raw-import-packages, eval = RUN_RAW_IMPORT}
+suppressPackageStartupMessages({
+  library(devtools)
+  library(UniProt.ws)
+  library(R.utils)
+})
+```
+
+```{r raw-import-utils, eval = RUN_RAW_IMPORT}
+# Huttenhain Lab shared utility functions, sourced live from GitHub:
+# Create.Pipeline.Directories(), Save.Csv.With.Timestamp(),
+# Make.LFQ.Contrast.Matrix(), Spectronaut cleaning/enrichment helpers.
+utils <- "https://raw.githubusercontent.com/HuttenhainLab/bp_utils/master/"
+source(paste0(utils, "enrichmentTestFunctions.R"))
+source(paste0(utils, "MSstats_V4_Functions.R"))
+
+drb_utils <- "https://raw.githubusercontent.com/HuttenhainLab/drb_utils/main/"
+source(paste0(drb_utils, "data_management.R"))
+source(paste0(drb_utils, "spectronaut_data_cleaning.R"))
+source(paste0(drb_utils, "gene_ontology_enrichment.R"))
+
+# Bind gene names onto a data table from its UniProt ID column.
+map.gene.names <- function(protein.column, taxonomy.id = 9606) {
+  unique.phosphosites <- unique(unlist(strsplit(as.character(protein.column), ";")))
+  UniProt.IDs <- unique(sapply(unique.phosphosites, function(x) strsplit(x, "_")[[1]][1]))
+
+  UniProt.mapping <- AnnotationDbi::select(UniProt.ws(taxId = 9606),
+                       keys = UniProt.IDs,
+                       columns = c("UniProtKB", "gene_primary"),
+                       keytype = "UniProtKB")
+
+  gene.name.map <- setNames(UniProt.mapping$Gene.Names..primary., UniProt.mapping$From)
+
+  map_protein <- function(entry) {
+    phosphosites <- unlist(strsplit(entry, ";"))
+    mapped_sites <- sapply(phosphosites, function(site) {
+      parts <- unlist(strsplit(site, "_"))
+      UniProtID <- parts[1]
+      gene_name <- gene.name.map[UniProtID]
+      if (!is.na(gene_name)) {
+        paste(c(gene_name, parts[-1]), collapse = "_")
+      } else {
+        site
+      }
+    })
+    paste(mapped_sites, collapse = ";")
+  }
+
+  mapped_column <- sapply(as.character(protein.column), map_protein)
+  return(mapped_column)
+}
+
+map.gene.names.clusterProfiler <- function(protein.column, protein.database.name = "org.Hs.eg.db") {
+  unique.phosphosites <- unique(unlist(strsplit(as.character(protein.column), ";")))
+  UniProt.IDs <- unique(sapply(unique.phosphosites, function(x) strsplit(x, "_")[[1]][1]))
+
+  if (!requireNamespace(protein.database.name, quietly = TRUE)) {
+    stop(paste("Package", protein.database.name, "is not installed. Please install it using BiocManager::install()."))
+  }
+
+  protein.database <- get(protein.database.name, envir = asNamespace(protein.database.name))
+
+  mapping <- bitr(unique(UniProt.IDs), fromType = "UNIPROT", toType = "SYMBOL", OrgDb = protein.database)
+  gene.name.map <- setNames(mapping$SYMBOL, mapping$UNIPROT)
+
+  map_protein <- function(entry) {
+    phosphosites <- unlist(strsplit(entry, ";"))
+    mapped_sites <- sapply(phosphosites, function(site) {
+      parts <- unlist(strsplit(site, "_"))
+      UniProtID <- parts[1]
+      gene_name <- gene.name.map[UniProtID]
+      if (!is.na(gene_name)) {
+        paste(c(gene_name, parts[-1]), collapse = "_")
+      } else {
+        site
+      }
+    })
+    paste(mapped_sites, collapse = ";")
+  }
+
+  mapped_column <- sapply(as.character(protein.column), map_protein)
+  return(mapped_column)
+}
+```
+
+```{r raw-import-parameters, eval = RUN_RAW_IMPORT}
+# Data Type: "SP" = Spectronaut, "MQ" = MaxQuant
+export.type <- "SP"
+
+# Appended to output folder/file names
+data.name <- "KO07_53min"
+Create.Pipeline.Directories(data.name)
+
+# TRUE: pipeline makes the replicate column unique by concatenating
+# Condition & Replicate, so MSstats doesn't treat technical replicates as
+# bioreplicates (correct for this APEX experiment's design).
+is.case.control <- TRUE
+
+if (export.type == "SP") {
+  # EDIT ME: path to your raw Spectronaut .tsv export.
+  spectronaut.lfq.report <- "path/to/KO07_53min_Report.tsv"
+} else if (export.type == "MQ") {
+  maxquant.evidence      <- "../example_data/example_data_MQ_evidence.txt"
+  maxquant.proteingroups <- "../example_data/example_data_MQ_proteinGroups.txt"
+  maxquant.annotations   <- "../example_data/example_data_MQ_annotations.csv"
+} else {
+  stop("Non-supported data type. Make sure data type is SP or MQ, otherwise pipeline will break.")
+}
+
+# Every pairwise comparison MSstats will test (a superset of
+# comparisons_of_interest in R/00_setup.R -- everything downstream filters
+# to whichever subset it needs).
+global.regexContrasts <- c(
+  "D14-D5", "D14-D9", "Primary-D14", "Primary-dHL60", "D14-dHL60",
+  "Primary-HL60", "Primary-D5", "D9-D5", "Primary-D9", "D14-HL60"
+)
+
+# Runs to drop before normalization (e.g. failed injections) -- none by
+# default, same as the original script.
+runs.to.remove <- c()
+```
+
+```{r raw-import-load, eval = RUN_RAW_IMPORT}
+if (export.type == "SP") {
+  spectronaut.lfq.report <- fread(spectronaut.lfq.report)
+} else if (export.type == "MQ") {
+  maxquant.evidence      <- fread(maxquant.evidence)
+  maxquant.proteingroups <- fread(maxquant.proteingroups)
+  maxquant.annotations   <- fread(maxquant.annotations)
+}
+```
+
+```{r raw-import-clean-contaminants, eval = RUN_RAW_IMPORT}
+if (export.type == "SP") {
+  # Contaminant protein accessions are prepended with "Cont_" -- Spectronaut
+  # doesn't strip these for you.
+  spectronaut.lfq.report <- spectronaut.lfq.report %>%
+    filter(!grepl("Cont_|NaN|TRYP_PIG", PG.ProteinGroups))
+}
+```
+
+```{r raw-import-unique-replicates, eval = RUN_RAW_IMPORT}
+if (is.case.control) {
+  spectronaut.lfq.report$R.Replicate <- paste(spectronaut.lfq.report$R.Condition, spectronaut.lfq.report$R.Replicate, sep = ".")
+}
+```
+
+```{r raw-import-to-msstats-format, eval = RUN_RAW_IMPORT, warning=FALSE}
+if (export.type == "SP") {
+  global.prepared <- SpectronauttoMSstatsFormat(
+    spectronaut.lfq.report,
+    filter_with_Qvalue = TRUE,
+    qvalue_cutoff = 0.01,
+    removeProtein_with1Feature = FALSE,
+    use_log_file = FALSE
+  )
+  Save.Csv.With.Timestamp(global.prepared, "CleanedPreprocessedData.csv", paste(data.name, "data", sep = "_"))
+} else if (export.type == "MQ") {
+  global.prepared <- MaxQtoMSstatsFormat(maxquant.evidence, maxquant.annotations, maxquant.proteingroups)
+  rm(maxquant.evidence, maxquant.annotations, maxquant.proteingroups)
+}
+
+global.prepared <- global.prepared[!(global.prepared$Run %in% runs.to.remove), ]
+```
+
+```{r raw-import-dataprocess, eval = RUN_RAW_IMPORT, warning=FALSE}
+global.proteinSummarization <- MSstats::dataProcess(
+  global.prepared,
+  normalization = 'equalizeMedians',
+  logTrans = 2,
+  featureSubset = 'highQuality',
+  summaryMethod = "TMP",
+  censoredInt = 'NA',
+  MBimpute = FALSE,
+  maxQuantileforCensored = 0.999
+)
+
+global.proteinSummarization$ProteinLevelData$gene.name <- map.gene.names(global.proteinSummarization$ProteinLevelData$Protein)
+
+Save.Csv.With.Timestamp(global.proteinSummarization$FeatureLevelData, "FeatureLevelData.csv", paste(data.name, "data", sep = "_"))
+Save.Csv.With.Timestamp(global.proteinSummarization$ProteinLevelData, "ProteinLevelData.csv", paste(data.name, "data", sep = "_"))
+```
+
+```{r raw-import-groupcomparison, eval = RUN_RAW_IMPORT}
+contrast.matrix <- Make.LFQ.Contrast.Matrix(input.data.frame = global.proteinSummarization, condition.vector = global.regexContrasts)
+
+global.pairwiseComparison <- MSstats::groupComparison(contrast.matrix, global.proteinSummarization)$ComparisonResult
+global.pairwiseComparison$gene.name <- map.gene.names.clusterProfiler(global.pairwiseComparison$Protein)
+
+Save.Csv.With.Timestamp(global.pairwiseComparison, "GroupComparisonsData.csv", paste(data.name, "data", sep = "_"))
+```
+
+```{r raw-import-handoff, eval = RUN_RAW_IMPORT}
+# Feed straight into the same object names the rest of this pipeline (and
+# every other script in this project) expects -- skips re-reading whatever
+# timestamped filename Save.Csv.With.Timestamp() just wrote, since that
+# stamp depends on today's date and isn't something this file can predict
+# ahead of time.
+protein   <- standardize_protein_dt(as.data.table(global.proteinSummarization$ProteinLevelData))
+groupcomp <- standardize_groupcomp_dt(as.data.table(global.pairwiseComparison))
+feature   <- as.data.table(global.proteinSummarization$FeatureLevelData)
+cleaned   <- as.data.table(global.prepared)
+
+cat("Raw import complete -- protein:", nrow(protein), "rows | groupcomp:", nrow(groupcomp),
+    "rows | feature:", nrow(feature), "rows | cleaned:", nrow(cleaned), "rows\n")
+```
+
+## 1b. Load the already-computed MSstats output (default)
+
+Runs only if `RUN_RAW_IMPORT` is `FALSE` above -- reads the four
+pre-computed CSVs from `data_dir` (`R/00_setup.R`), exactly as every other
+script in this project does.
+
+```{r load-data, eval = !RUN_RAW_IMPORT}
+raw <- load_proteomics_data(data_dir)
+
+protein   <- standardize_protein_dt(raw$protein)     # ProteinLevelData
+groupcomp <- standardize_groupcomp_dt(raw$groupcomp)  # GroupComparisonsData
+feature   <- raw$feature                              # FeatureLevelData
+cleaned   <- raw$cleaned                               # CleanedPreprocessedData
+```
+
+```{r load-data-summary}
+cat("Protein-level rows:", nrow(protein), " | columns:", paste(names(protein), collapse = ", "), "\n")
+cat("Group comparison rows:", nrow(groupcomp), " | columns:", paste(names(groupcomp), collapse = ", "), "\n")
+cat("Feature-level rows:", nrow(feature), " | columns:", paste(names(feature), collapse = ", "), "\n")
+cat("Cleaned/preprocessed rows:", nrow(cleaned), " | columns:", paste(names(cleaned), collapse = ", "), "\n")
+```
+
+# 2. Exclude the D9.2 outlier
+
+`outlier_samples` (currently `r outlier_samples`, set once in `R/00_setup.R`)
+is excluded from analysis everywhere below — a single switch instead of
+filtering by hand in each section. **The raw data for D9.2 is never deleted
+anywhere on disk** — it's still present, untouched, in every file loaded
+above; this only filters it out at the analysis step, consistently, so no
+figure or table includes it while another quietly still does.
+
+Suggested Methods-section language for this exclusion (see the project's
+`README.md` for the fuller version): *"One biological replicate (D9.2) was
+excluded from downstream analysis due to a documented contamination event
+during differentiation, occurring independently of sample collection or MS
+processing; raw data for this replicate were retained but excluded from all
+reported analyses."*
+
+```{r qc-filtered-protein-table}
+protein_qc <- protein[!(SUBJECT %in% outlier_samples)]
+cat("Dropped as outliers:", paste(outlier_samples, collapse = ", "), "\n")
+cat("Remaining D9 subjects:", paste(sort(unique(protein_qc[GROUP == "D9", SUBJECT])), collapse = ", "), "\n")
+```
+
+# 3. PCA — all samples, then with D9.2 removed
+
+```{r pca-all-samples, fig.width=7, fig.height=6}
+intensity_matrix <- build_intensity_matrix(protein)
+
+pca_all <- run_pca(intensity_matrix)
+p_pca_all <- plot_pca(pca_all)
+p_pca_all
+
+ggsave(file.path(fig_dir, "PCA", "PCA_all_samples.pdf"), p_pca_all, width = 7, height = 6)
+cat("Saved:", file.path(fig_dir, "PCA", "PCA_all_samples.pdf"), "\n")
+```
+
+```{r pca-outlier-removed, fig.width=7, fig.height=6}
+run_removed_matrix <- drop_samples(intensity_matrix, outlier_samples)
+
+pca_removed <- run_pca(run_removed_matrix)
+p_pca_removed <- plot_pca(pca_removed)
+p_pca_removed
+
+ggsave(file.path(fig_dir, "PCA", "PCA_outlier_removed.pdf"), p_pca_removed, width = 7, height = 6)
+cat("Saved:", file.path(fig_dir, "PCA", "PCA_outlier_removed.pdf"), "\n")
+```
+
+# 4. Pearson correlation
+
+## 4a. Sample-level Pearson correlation heatmap
+
+```{r pearson-sample-correlation, fig.width=8, fig.height=7}
+cor_matrix_samples_pearson <- compute_sample_correlation(run_removed_matrix, method = "pearson")
+ht_sample_cor_pearson <- plot_sample_correlation_heatmap(cor_matrix_samples_pearson, name = "Pearson r")
+draw(ht_sample_cor_pearson)
+
+save_heatmap(ht_sample_cor_pearson,
+             file.path(fig_dir, "Correlation_Heatmaps", "Sample_correlation_heatmap_Pearson.pdf"),
+             width = 8, height = 7)
+cat("Saved:", file.path(fig_dir, "Correlation_Heatmaps", "Sample_correlation_heatmap_Pearson.pdf"), "\n")
+```
+
+## 4b. Pairwise log2FC heatmap (D5/D9/D14 comparisons)
+
+```{r pearson-log2fc-heatmap, fig.width=7, fig.height=8}
+keep_labels <- c("D9-D5", "D14-D9", "D14-D5")
+
+heat_df <- unique(
+  groupcomp[Label %in% keep_labels & !is.na(gene.name) & !is.na(log2FC),
+            .(gene.name, Label, log2FC)],
+  by = c("gene.name", "Label")
+)
+heat_wide <- dcast(heat_df, gene.name ~ Label, value.var = "log2FC", fun.aggregate = mean)
+heat_mat_log2fc <- as.matrix(as.data.frame(heat_wide)[, -1])
+rownames(heat_mat_log2fc) <- heat_wide$gene.name
+heat_mat_log2fc <- heat_mat_log2fc[apply(heat_mat_log2fc, 1, function(x) all(is.finite(x))), , drop = FALSE]
+
+ht_log2fc <- Heatmap(
+  heat_mat_log2fc,
+  name = "log2FC",
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = FALSE,
+  show_column_names = TRUE,
+  column_title = "Pairwise changes across D5, D9, D14",
+  row_title = paste(nrow(heat_mat_log2fc), "proteins"),
+  col = pink_ramp_diverging()
+)
+draw(ht_log2fc)
+
+save_heatmap(ht_log2fc, file.path(fig_dir, "Correlation_Heatmaps", "Pairwise_log2FC_heatmap.pdf"),
+             width = 7, height = 8)
+cat("Saved:", file.path(fig_dir, "Correlation_Heatmaps", "Pairwise_log2FC_heatmap.pdf"), "\n")
+```
+
+## 4c. Cross-condition Pearson panels (G/H/I style figure)
+
+```{r pearson-ghi-panels, fig.width=14, fig.height=4.8}
+scatter_d14   <- compute_condition_scatter_data(protein_qc, "Primary", "D14")
+scatter_dhl60 <- compute_condition_scatter_data(protein_qc, "Primary", "dHL60")
+
+all_vals <- c(scatter_d14$x, scatter_d14$y, scatter_dhl60$x, scatter_dhl60$y)
+axis_lim <- c(floor(min(all_vals, na.rm = TRUE)), ceiling(max(all_vals, na.rm = TRUE)))
+
+p1 <- plot_condition_scatter(scatter_d14,  "Primary", "D14",   axis_lim, axis_lim, line_color = "#2C8ED6")
+p2 <- plot_condition_scatter(scatter_dhl60, "Primary", "dHL60", axis_lim, axis_lim, line_color = "#F4A022")
+
+cond_keep <- c("D5", "HL60", "dHL60", "Primary", "D14", "D9")
+cor_mat_cond_pearson <- compute_condition_correlation(protein_qc, cond_keep, method = "pearson")
+
+manual_order <- cond_keep[cond_keep %in% colnames(cor_mat_cond_pearson)]
+p3_manual <- plot_condition_correlation_tile(cor_mat_cond_pearson, order_type = "manual", order = manual_order)
+p3_auto   <- plot_condition_correlation_tile(cor_mat_cond_pearson, order_type = "cluster")
+
+p1_lab  <- add_panel_label(p1, "G)")
+p2_lab  <- add_panel_label(p2, "H)")
+p3m_lab <- add_panel_label(p3_manual, "I)")
+p3a_lab <- add_panel_label(p3_auto, "I)")
+
+combined_manual <- p1_lab + p2_lab + p3m_lab + plot_layout(widths = c(1, 1, 1.05))
+combined_auto   <- p1_lab + p2_lab + p3a_lab + plot_layout(widths = c(1, 1, 1.05))
+print(combined_manual)
+print(combined_auto)
+
+ggsave(file.path(fig_dir, "Correlation_Heatmaps", "Pearson_GHI_manual_order.pdf"), combined_manual, width = 14, height = 4.8)
+ggsave(file.path(fig_dir, "Correlation_Heatmaps", "Pearson_GHI_auto_order.pdf"), combined_auto, width = 14, height = 4.8)
+ggsave(file.path(fig_dir, "Correlation_Heatmaps", "Pearson_GHI_manual_order.png"), combined_manual, width = 14, height = 4.8, dpi = 300)
+ggsave(file.path(fig_dir, "Correlation_Heatmaps", "Pearson_GHI_auto_order.png"), combined_auto, width = 14, height = 4.8, dpi = 300)
+cat("Saved GHI panels to:", file.path(fig_dir, "Correlation_Heatmaps"), "\n")
+```
+
+## 4d. Condition correlation heatmap with dendrograms
+
+```{r pearson-condition-dendro, fig.width=6.5, fig.height=5.5}
+condition_colors <- c(
+  "D5" = "#8DB6D9", "HL60" = "#F2AE4A", "dHL60" = "#E49A2F",
+  "Primary" = "#C03A87", "D14" = "#2C8ED6", "D9" = "#4F93C6"
+)
+
+ht_condition_dendro_pearson <- plot_condition_correlation_dendro(cor_mat_cond_pearson, condition_colors)
+draw(ht_condition_dendro_pearson, heatmap_legend_side = "right", annotation_legend_side = "right")
+
+save_heatmap(ht_condition_dendro_pearson,
+             file.path(fig_dir, "Correlation_Heatmaps", "Pearson_condition_matrix_dendro.pdf"),
+             width = 6.5, height = 5.5,
+             heatmap_legend_side = "right", annotation_legend_side = "right")
+cat("Saved:", file.path(fig_dir, "Correlation_Heatmaps", "Pearson_condition_matrix_dendro.pdf"), "\n")
+```
+
+# 5. Spearman correlation
+
+Same two panels as Pearson above (sample-level + condition-level), as a
+robustness check with rank-based correlation instead of linear.
+
+## 5a. Sample-level Spearman correlation heatmap
+
+```{r spearman-sample-correlation, fig.width=8, fig.height=7}
+cor_matrix_samples_spearman <- compute_sample_correlation(run_removed_matrix, method = "spearman")
+ht_sample_cor_spearman <- plot_sample_correlation_heatmap(cor_matrix_samples_spearman, name = "Spearman rho")
+draw(ht_sample_cor_spearman)
+
+save_heatmap(ht_sample_cor_spearman,
+             file.path(fig_dir, "Correlation_Heatmaps", "Sample_correlation_heatmap_Spearman.pdf"),
+             width = 8, height = 7)
+cat("Saved:", file.path(fig_dir, "Correlation_Heatmaps", "Sample_correlation_heatmap_Spearman.pdf"), "\n")
+```
+
+## 5b. Condition-level Spearman correlation (tile heatmap)
+
+```{r spearman-condition-correlation, fig.width=7, fig.height=6}
+cor_mat_cond_spearman <- compute_condition_correlation(protein_qc, cond_keep, method = "spearman")
+
+p_spearman_manual <- plot_condition_correlation_tile(cor_mat_cond_spearman, order_type = "manual", order = manual_order)
+p_spearman_auto   <- plot_condition_correlation_tile(cor_mat_cond_spearman, order_type = "cluster")
+print(p_spearman_manual)
+print(p_spearman_auto)
+
+ggsave(file.path(fig_dir, "Correlation_Heatmaps", "Spearman_condition_manual_order.pdf"), p_spearman_manual, width = 7, height = 6)
+ggsave(file.path(fig_dir, "Correlation_Heatmaps", "Spearman_condition_auto_order.pdf"), p_spearman_auto, width = 7, height = 6)
+ggsave(file.path(fig_dir, "Correlation_Heatmaps", "Spearman_condition_manual_order.png"), p_spearman_manual, width = 7, height = 6, dpi = 300)
+ggsave(file.path(fig_dir, "Correlation_Heatmaps", "Spearman_condition_auto_order.png"), p_spearman_auto, width = 7, height = 6, dpi = 300)
+cat("Saved Spearman condition-level heatmaps to:", file.path(fig_dir, "Correlation_Heatmaps"), "\n")
+```
+
+# 6. Figure 3A — temporal cluster heatmap, trend lines, GO (simplify()-collapsed)
+
+D9.2 excluded (`k = 4`, this script's own local override — see its header
+comment for why). Runs the standalone script's full pipeline top to bottom
+and saves its own heatmap PDF/PNG, translation tables (heatmap-cluster-
+number-to-table-cluster-number), GO term tables, and per-protein z-score
+matrix — watch the "Saved:" lines in the output below for every file this
+step produces.
+
+```{r figure-3a-d92-excluded}
+source("Figure3A_Cluster_Heatmap_GO_noD9.2.R")
+```
+
+# 7. Volcano plots
+
+## 7a. Raw p-value axis
+
+```{r volcano-auto-labeled, fig.width=8, fig.height=10}
+volc_x_lim <- c(-4.5, 8.5)
+volc_y_lim <- c(0, 12.5)
+comparisons_updown <- c("D9-D5", "D14-D9")
+
+p_volc_B_auto <- plot_volcano("D9-D5", groupcomp, label_mode = "top_n", top_n = 20,
+                               title = "D9 vs D5")
+p_volc_C_auto <- plot_volcano("D14-D9", groupcomp, label_mode = "top_n", top_n = 20,
+                               title = "D14 vs D9")
+combined_volcano_auto <- p_volc_B_auto / p_volc_C_auto
+print(combined_volcano_auto)
+
+ggsave(file.path(fig_dir, "Volcano_Plots", "D9D5_D14D9_volcano_autolabeled.pdf"),
+       combined_volcano_auto, width = 8, height = 10)
+```
+
+```{r volcano-custom-labeled, fig.width=8, fig.height=10}
+genes_B <- c("DEFA1", "FCAR", "ITGAM", "CYBB", "PADI4",       # D9-D5 up
+             "TAL1", "HBE1", "HLA-DRA", "SYTL4", "SNCA")      # D9-D5 down
+genes_C <- c("DAB2", "ANXA2", "SDCBP", "ICAM1", "PDLIM2",     # D14-D9 up
+             "NOL6", "RPS4Y1", "NDUFA3", "TIMM23", "ESRRA")   # D14-D9 down
+
+p_volc_B <- plot_volcano("D9-D5", groupcomp, label_mode = "custom", label_genes = genes_B,
+                          x_lim = volc_x_lim, y_lim = volc_y_lim,
+                          title = "Early Neutrophils vs Granulocytes",
+                          x_label = "Log2FC (Early Neutrophils/Granulocytes)")
+p_volc_C <- plot_volcano("D14-D9", groupcomp, label_mode = "custom", label_genes = genes_C,
+                          x_lim = volc_x_lim, y_lim = volc_y_lim,
+                          title = "Mature Neutrophils vs Early Neutrophils",
+                          x_label = "Log2FC (Mature Neutrophils/Early Neutrophils)")
+combined_volcano_custom <- p_volc_B / p_volc_C
+print(combined_volcano_custom)
+
+ggsave(file.path(fig_dir, "Volcano_Plots", "D9D5_D14D9_volcano_labeled.pdf"),
+       combined_volcano_custom, width = 8, height = 10)
+ggsave(file.path(fig_dir, "Volcano_Plots", "D9D5_D14D9_volcano_labeled.png"),
+       combined_volcano_custom, width = 8, height = 10, dpi = 300)
+ggsave(file.path(fig_dir, "Volcano_Plots", "D9D5_volcano_labeled.pdf"), p_volc_B, width = 8, height = 5)
+ggsave(file.path(fig_dir, "Volcano_Plots", "D14D9_volcano_labeled.pdf"), p_volc_C, width = 8, height = 5)
+```
+
+```{r volcano-d14d5-plus-go, fig.width=12, fig.height=12}
+p_volc_D14D5 <- plot_volcano(
+  "D14-D5", groupcomp,
+  label_mode = "top_n", top_n = 20,
+  x_lim = volc_x_lim, y_lim = volc_y_lim,
+  title = "D14 vs D5"
+)
+
+gene_universe_D14D5 <- unique(groupcomp[Label == "D14-D5" & !is.na(gene.name), gene.name])
+go_D14D5 <- plot_go_updown(
+  "D14-D5", groupcomp, gene_universe_D14D5,
+  padj_cutoff = PADJ_CUTOFF, top_n = 10
+)
+
+if (!is.null(go_D14D5$plot)) {
+  combined_D14D5_volcano_go <- p_volc_D14D5 + go_D14D5$plot + plot_layout(widths = c(1, 1.3))
+} else {
+  combined_D14D5_volcano_go <- p_volc_D14D5
+  message("No GO BP terms passed the cutoff for D14-D5 up/down genes; showing volcano only.")
+}
+print(combined_D14D5_volcano_go)
+
+ggsave(file.path(fig_dir, "Volcano_Plots", "D14D5_volcano_with_top10_GO.pdf"),
+       combined_D14D5_volcano_go, width = 12, height = 12)
+ggsave(file.path(fig_dir, "Volcano_Plots", "D14D5_volcano_with_top10_GO.png"),
+       combined_D14D5_volcano_go, width = 12, height = 12, dpi = 300)
+ggsave(file.path(fig_dir, "Volcano_Plots", "D14D5_volcano_labeled.pdf"),
+       p_volc_D14D5, width = 8, height = 5)
+ggsave(file.path(fig_dir, "Volcano_Plots", "D14D5_volcano_labeled.png"),
+       p_volc_D14D5, width = 8, height = 5, dpi = 300)
+```
+
+Top hits tables (one Up/Down table per comparison):
+
+```{r volcano-top-hits-tables}
+for (comp in comparisons_updown) {
+  hits <- top_hits_table(groupcomp, comp, padj_cutoff = PADJ_CUTOFF, n = 50)
+  cat("\n====", comp, "====\nUP:\n"); print(hits$up)
+  cat("\nDOWN:\n"); print(hits$down)
+}
+```
+
+## 7b. Adjusted p-value axis
+
+Same plots, re-drawn with `-log10(adjusted p-value)` on the y-axis instead of
+raw p-value; axis bounds are computed fresh since adjusted p-values are
+always >= raw (BH correction only inflates them).
+
+```{r volcano-shared-limits-adjp}
+compute_shared_volcano_limits <- function(groupcomp_dt, labels, y_metric = "adj.pvalue") {
+  sub <- groupcomp_dt[
+    Label %in% labels & !is.na(log2FC) & !is.na(pvalue) & !is.na(adj.pvalue)
+  ]
+  yvals <- -log10(sub[[y_metric]])
+  list(
+    x_lim = c(floor(min(sub$log2FC, na.rm = TRUE)), ceiling(max(sub$log2FC, na.rm = TRUE))),
+    y_lim = c(0, ceiling(max(yvals, na.rm = TRUE)))
+  )
+}
+
+out_dir_adjp <- file.path(fig_dir, "Adjusted_Pvalue_Test_Figures")
+dir.create(out_dir_adjp, recursive = TRUE, showWarnings = FALSE)
+
+adj_limits <- compute_shared_volcano_limits(groupcomp, c("D9-D5", "D14-D9", "D14-D5"))
+adj_x_lim <- adj_limits$x_lim
+adj_y_lim <- adj_limits$y_lim
+cat("Shared adjusted-p-value axis bounds -- x:", adj_x_lim, " y:", adj_y_lim, "\n")
+```
+
+```{r volcano-auto-labeled-adjp, fig.width=8, fig.height=10}
+p_volc_B_auto_adjp <- plot_volcano(
+  "D9-D5", groupcomp,
+  label_mode = "top_n", top_n = 20,
+  x_lim = adj_x_lim, y_lim = adj_y_lim,
+  y_metric = "adj.pvalue",
+  title = "D9 vs D5"
+)
+p_volc_C_auto_adjp <- plot_volcano(
+  "D14-D9", groupcomp,
+  label_mode = "top_n", top_n = 20,
+  x_lim = adj_x_lim, y_lim = adj_y_lim,
+  y_metric = "adj.pvalue",
+  title = "D14 vs D9"
+)
+combined_volcano_auto_adjp <- p_volc_B_auto_adjp / p_volc_C_auto_adjp
+print(combined_volcano_auto_adjp)
+
+ggsave(file.path(out_dir_adjp, "D9D5_D14D9_volcano_autolabeled_ADJP.pdf"),
+       combined_volcano_auto_adjp, width = 8, height = 10)
+```
+
+```{r volcano-custom-labeled-adjp, fig.width=8, fig.height=10}
+p_volc_B_adjp <- plot_volcano(
+  "D9-D5", groupcomp, label_mode = "custom", label_genes = genes_B,
+  x_lim = adj_x_lim, y_lim = adj_y_lim, y_metric = "adj.pvalue",
+  title = "Early Neutrophils vs Granulocytes",
+  x_label = "Log2FC (Early Neutrophils/Granulocytes)"
+)
+p_volc_C_adjp <- plot_volcano(
+  "D14-D9", groupcomp, label_mode = "custom", label_genes = genes_C,
+  x_lim = adj_x_lim, y_lim = adj_y_lim, y_metric = "adj.pvalue",
+  title = "Mature Neutrophils vs Early Neutrophils",
+  x_label = "Log2FC (Mature Neutrophils/Early Neutrophils)"
+)
+combined_volcano_custom_adjp <- p_volc_B_adjp / p_volc_C_adjp
+print(combined_volcano_custom_adjp)
+
+ggsave(file.path(out_dir_adjp, "D9D5_D14D9_volcano_labeled_ADJP.pdf"),
+       combined_volcano_custom_adjp, width = 8, height = 10)
+ggsave(file.path(out_dir_adjp, "D9D5_D14D9_volcano_labeled_ADJP.png"),
+       combined_volcano_custom_adjp, width = 8, height = 10, dpi = 300)
+ggsave(file.path(out_dir_adjp, "D9D5_volcano_labeled_ADJP.pdf"), p_volc_B_adjp, width = 8, height = 5)
+ggsave(file.path(out_dir_adjp, "D14D9_volcano_labeled_ADJP.pdf"), p_volc_C_adjp, width = 8, height = 5)
+```
+
+```{r volcano-d14d5-adjp, fig.width=8, fig.height=5}
+p_volc_D14D5_adjp <- plot_volcano(
+  "D14-D5", groupcomp,
+  label_mode = "top_n", top_n = 20,
+  x_lim = adj_x_lim, y_lim = adj_y_lim,
+  y_metric = "adj.pvalue",
+  title = "D14 vs D5"
+)
+print(p_volc_D14D5_adjp)
+
+ggsave(file.path(out_dir_adjp, "D14D5_volcano_labeled_ADJP.pdf"), p_volc_D14D5_adjp, width = 8, height = 5)
+ggsave(file.path(out_dir_adjp, "D14D5_volcano_labeled_ADJP.png"), p_volc_D14D5_adjp, width = 8, height = 5, dpi = 300)
+```
+
+```{r volcano-d14d5-plus-go-adjp, fig.width=12, fig.height=7.5}
+go_D14D5_adjp <- plot_go_updown(
+  "D14-D5", groupcomp, gene_universe_D14D5,
+  padj_cutoff = PADJ_CUTOFF, top_n = 5
+)
+
+if (!is.null(go_D14D5_adjp$plot)) {
+  combined_D14D5_volcano_go_adjp <- p_volc_D14D5_adjp + go_D14D5_adjp$plot + plot_layout(widths = c(1, 1.3))
+} else {
+  combined_D14D5_volcano_go_adjp <- p_volc_D14D5_adjp
+  message("No GO BP terms passed the cutoff for D14-D5 up/down genes; showing volcano only.")
+}
+print(combined_D14D5_volcano_go_adjp)
+
+ggsave(file.path(out_dir_adjp, "D14D5_volcano_with_top5_GO_ADJP.pdf"),
+       combined_D14D5_volcano_go_adjp, width = 12, height = 7.5)
+ggsave(file.path(out_dir_adjp, "D14D5_volcano_with_top5_GO_ADJP.png"),
+       combined_D14D5_volcano_go_adjp, width = 12, height = 7.5, dpi = 300)
+cat("Saved adjusted-p-value volcano plots to:", out_dir_adjp, "\n")
+```
+
+# 8. GO Biological Process, Up/Down, simplify()-collapsed
+
+Runs `GO_Simplify_UpDown.R`: per comparison, Up/Down gene sets (`adj.pvalue
+< 0.05`, no fold-change cutoff) -> `enrichGO()` -> `simplify()` (Wang, cutoff
+0.7) -> top-5-per-direction bar plot. Saves to its own `output/` subfolder
+at the project root, not `figures/GO_Enrichment/`.
+
+```{r go-simplify-updown}
+source("GO_Simplify_UpDown.R")
+```
+
+# 9. Figure 4A — HPA nuclear/lamina heatmap
+
+Runs `Figure4A_Nuclear_Heatmap.R`: HPA nuclear gene list restricted to
+significant genes, LBR/LMNA/LMNB1/LMNB2 always forced in and labeled,
+`k = 4` clusters, dendrogram heatmap, per-gene trajectory panels, and the
+translation-table + per-protein z-score CSV export.
+
+```{r figure-4a-nuclear}
+source("Figure4A_Nuclear_Heatmap.R")
+```
+
+# 10. Output tables: group comparisons + cleaned/processed data
+
+Saves the four core MSstats tables as a standalone, versioned snapshot, so a
+reviewer has the exact tables this run was built from without `data_dir`.
+Everything else (cluster gene lists, GO tables, z-score matrices) is already
+saved by the sections above.
+
+```{r output-tables-processed-data}
+processed_dir <- file.path(table_dir, "processed_data")
+dir.create(processed_dir, recursive = TRUE, showWarnings = FALSE)
+
+fwrite(groupcomp, file.path(processed_dir, "GroupComparisons_Table.csv"))
+
+# Full table (D9.2 included) and the QC-filtered version actually used
+# throughout the rest of the pipeline, saved separately.
+fwrite(protein,    file.path(processed_dir, "ProteinLevelData_all_samples.csv"))
+fwrite(protein_qc, file.path(processed_dir, "ProteinLevelData_QC_filtered_noD9.2.csv"))
+
+fwrite(feature, file.path(processed_dir, "FeatureLevelData.csv"))
+fwrite(cleaned, file.path(processed_dir, "CleanedPreprocessedData.csv"))
+
+cat("Saved processed data tables to:\n ", processed_dir, "\n")
+cat(" -", "GroupComparisons_Table.csv", "(", nrow(groupcomp), "rows )\n")
+cat(" -", "ProteinLevelData_all_samples.csv", "(", nrow(protein), "rows )\n")
+cat(" -", "ProteinLevelData_QC_filtered_noD9.2.csv", "(", nrow(protein_qc), "rows )\n")
+cat(" -", "FeatureLevelData.csv", "(", nrow(feature), "rows )\n")
+cat(" -", "CleanedPreprocessedData.csv", "(", nrow(cleaned), "rows )\n")
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

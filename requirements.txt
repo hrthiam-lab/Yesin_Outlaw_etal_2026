@@ -1,0 +1,10 @@
+# Fig5_MigrationTracking_code pipeline
+# Tested with Python 3.12.11
+numpy>=2.0
+pandas>=2.0
+scipy>=1.16
+scikit-image>=0.24
+opencv-python>=4.10
+tqdm>=4.66
+natsort>=8.4
+mahotas>=1.4
